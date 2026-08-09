@@ -1897,6 +1897,7 @@ def agent_card():
 
 
 @app.route("/a2a/message:send", methods=["POST"])
+@app.route("/message:send", methods=["POST"])
 def message_send():
     err = require_a2a()
     if err:
@@ -1993,6 +1994,7 @@ def get_owned_task(task_id):
 
 
 @app.get("/a2a/tasks/<task_id>")
+@app.get("/tasks/<task_id>")
 def get_task(task_id):
     err = require_a2a()
     if err:
@@ -2005,6 +2007,7 @@ def get_task(task_id):
 
 
 @app.get("/a2a/tasks")
+@app.get("/tasks")
 def list_tasks():
     err = require_a2a()
     if err:
@@ -2092,6 +2095,7 @@ def message_send_continuation():
 
 
 @app.route("/a2a/tasks/<task_id>:cancel", methods=["POST"])
+@app.route("/tasks/<task_id>:cancel", methods=["POST"])
 def cancel_task(task_id):
     err = require_a2a()
     if err:
