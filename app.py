@@ -1629,7 +1629,7 @@ def handle_commit(data):
 
 DB_PATH = os.environ.get("A2A_DB", "a2a_invoice.sqlite3")
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
-PROFILE = "ga5-invoice-action-agent/v1"
+A2A_PROFILE = "ga5-invoice-action-agent/v1"
 VERSION = "1.0"
 INPUT_MODE = "application/vnd.ga5.invoice-claim-batch+json"
 PROPOSAL_MODE = "application/vnd.ga5.invoice-action-proposals+json"
