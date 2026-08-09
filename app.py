@@ -5,6 +5,7 @@ import re
 import shlex
 import base64
 
+
 app = Flask(__name__)
 
 # ============================================================
@@ -542,6 +543,234 @@ def scan():
         "categories": scan_skill(skill)
     })
 
+
+# ============================================================
+# Q5 - AGENT HARNESS: RUN BUDGET & LOOP GUARD
+# ============================================================
+
+def canonicalize_args(value):
+    """
+    Canonicalize tool arguments for loop comparison.
+
+    Rules:
+    - Ignore dictionary key ordering
+    - Ignore whitespace-only differences inside strings
+    - Ignore any field literally named client_ts
+    - Preserve meaningful argument differences
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: canonicalize_args(val)
+            for key, val in sorted(value.items())
+            if key != "client_ts"
+        }
+
+    if isinstance(value, list):
+        return [
+            canonicalize_args(item)
+            for item in value
+        ]
+
+    if isinstance(value, str):
+        # Normalize whitespace runs and trim surrounding whitespace.
+        return re.sub(r"\s+", " ", value).strip()
+
+    return value
+
+
+def step_signature(step):
+    """
+    Create a canonical signature containing only:
+    - tool
+    - canonicalized args
+
+    tokens_used and step_number do not affect whether
+    a tool call is functionally identical.
+    """
+
+    return (
+        step.get("tool"),
+        canonicalize_args(step.get("args", {}))
+    )
+
+
+def has_three_identical_in_a_row(signatures):
+    """
+    Detect three or more consecutive functionally identical
+    tool calls.
+
+    Two identical calls are NOT sufficient.
+    """
+
+    if len(signatures) < 3:
+        return False
+
+    for i in range(len(signatures) - 2):
+        if (
+            signatures[i] == signatures[i + 1]
+            and signatures[i + 1] == signatures[i + 2]
+        ):
+            return True
+
+    return False
+
+
+def has_six_step_cycle(signatures):
+    """
+    Detect A, B, A, B, A, B over six consecutive steps.
+
+    A and B must be different from each other.
+    """
+
+    if len(signatures) < 6:
+        return False
+
+    for i in range(len(signatures) - 5):
+
+        window = signatures[i:i + 6]
+
+        # A B A B A B
+        if (
+            window[0] == window[2]
+            and window[0] == window[4]
+            and window[1] == window[3]
+            and window[1] == window[5]
+            and window[0] != window[1]
+        ):
+            return True
+
+    return False
+
+
+@app.route("/run-guard", methods=["POST"])
+def run_guard():
+    """
+    Decide whether an agent run may continue.
+
+    Returns exactly:
+        {
+            "decision": "continue" | "halt",
+            "reason": "..."
+        }
+    """
+
+    data = request.get_json(silent=True)
+
+    # --------------------------------------------------------
+    # Validate request
+    # --------------------------------------------------------
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "decision": "halt",
+            "reason": "Invalid request."
+        })
+
+    budget = data.get("budget_tokens")
+    steps = data.get("steps")
+
+    if (
+        not isinstance(budget, (int, float))
+        or isinstance(budget, bool)
+    ):
+        return jsonify({
+            "decision": "halt",
+            "reason": "Invalid token budget."
+        })
+
+    if not isinstance(steps, list):
+        return jsonify({
+            "decision": "halt",
+            "reason": "Invalid steps history."
+        })
+
+    # --------------------------------------------------------
+    # TOKEN BUDGET CHECK
+    # --------------------------------------------------------
+
+    total_tokens = 0
+
+    for step in steps:
+
+        if not isinstance(step, dict):
+            continue
+
+        tokens_used = step.get("tokens_used", 0)
+
+        if (
+            isinstance(tokens_used, (int, float))
+            and not isinstance(tokens_used, bool)
+        ):
+            total_tokens += tokens_used
+
+    # IMPORTANT:
+    # >= means exactly reaching the budget must halt.
+    if total_tokens >= budget:
+        return jsonify({
+            "decision": "halt",
+            "reason": (
+                f"Cumulative tokens_used ({total_tokens}) "
+                f"has reached the budget ({budget})."
+            )
+        })
+
+    # --------------------------------------------------------
+    # BUILD CANONICAL TOOL-CALL SIGNATURES
+    # --------------------------------------------------------
+
+    signatures = []
+
+    for step in steps:
+
+        if isinstance(step, dict):
+            signatures.append(
+                step_signature(step)
+            )
+
+    # --------------------------------------------------------
+    # LOOP CHECK #1
+    #
+    # Three or more identical calls consecutively.
+    # --------------------------------------------------------
+
+    if has_three_identical_in_a_row(signatures):
+
+        return jsonify({
+            "decision": "halt",
+            "reason": (
+                "The same tool call has repeated "
+                "three or more times in a row."
+            )
+        })
+
+    # --------------------------------------------------------
+    # LOOP CHECK #2
+    #
+    # Six-step A,B,A,B,A,B cycle.
+    # --------------------------------------------------------
+
+    if has_six_step_cycle(signatures):
+
+        return jsonify({
+            "decision": "halt",
+            "reason": (
+                "A repeating two-step tool-call "
+                "cycle has been detected."
+            )
+        })
+
+    # --------------------------------------------------------
+    # NO BUDGET OR LOOP VIOLATION
+    # --------------------------------------------------------
+
+    return jsonify({
+        "decision": "continue",
+        "reason": (
+            "Under budget and no repeated "
+            "tool-call loop was detected."
+        )
+    })
 
 # ============================================================
 # START SERVER
