@@ -1,1 +1,3 @@
-Flask\nrequests\ngunicorn\n
+Flask
+requests
+gunicorn
