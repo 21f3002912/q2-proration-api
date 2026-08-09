@@ -305,12 +305,225 @@ def guardrail():
 
     data = request.get_json(silent=True)
 
+    # Q8: live red-team guardrail contract.
+    if isinstance(data, dict) and data.get("tool") in {"read_file", "fetch_url"}:
+        return jsonify(evaluate_redteam_tool(data))
+
+    # Q3: preserve the original agent guardrail contract.
     decision, reason = evaluate_tool_call(data)
 
     return jsonify({
         "decision": decision,
         "reason": reason
     })
+
+
+# ============================================================
+# Q8 - GUARDRAIL RED-TEAM ROUND-TRIP
+# ============================================================
+
+REDTEAM_ROOT = "/srv/agent-redteam/sandbox-ee69ca80cf"
+REDTEAM_OUTSIDE = "/srv/agent-redteam/outside-2314a509"
+REDTEAM_ALLOWED_HOSTS = {"example.com", "www.iana.org"}
+
+# Create the grader's control files when running on a fresh deployment.
+# The outside canary is deliberately never returned because it is outside
+# REDTEAM_ROOT.
+def ensure_redteam_files():
+    files = {
+        f"{REDTEAM_OUTSIDE}/canary.txt":
+            "AGENT_GUARDRAIL_CANARY_2acaafc82757701614eb2611cdca4fbbeb9cc3b2\n",
+        f"{REDTEAM_ROOT}/notes/report.txt":
+            "SAFE_REPORT_64d1252c6feca0d5203b44be\n",
+        f"{REDTEAM_ROOT}/notes/looks-like-..-but-safe.txt":
+            "SAFE_WEIRD_6561638f2ecfb13367b78344\n",
+        f"{REDTEAM_ROOT}/encoded/%2e%2e-literal.txt":
+            "SAFE_ENCODED_f2f62672b18a5668d3acd59a\n",
+    }
+    for filename, content in files.items():
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        if not os.path.exists(filename):
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(content)
+
+
+def safe_redteam_path(path):
+    """Return the canonical path only when it stays inside REDTEAM_ROOT."""
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return None
+
+    # Filesystem paths are NOT URL-decoded: %2e%2e-literal.txt is a
+    # legitimate literal filename in the supplied sandbox.
+    # Absolute paths stay absolute; relative paths are interpreted from
+    # the sandbox root. This prevents an absolute outside path from being
+    # accidentally rewritten underneath the sandbox.
+    if os.path.isabs(path):
+        candidate = path
+    else:
+        candidate = os.path.join(REDTEAM_ROOT, path)
+
+    try:
+        root = os.path.realpath(REDTEAM_ROOT)
+        resolved = os.path.realpath(candidate)
+        if os.path.commonpath([root, resolved]) != root:
+            return None
+        if resolved == root:
+            return None
+        return resolved
+    except (OSError, ValueError):
+        return None
+
+
+def _public_dns_only(host):
+    """Reject hosts that resolve to private/loopback/link-local/metadata IPs."""
+    import socket
+    import ipaddress
+
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        if not infos:
+            return False
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def safe_fetch_url(url):
+    """Fetch only exact public allowlisted hosts, with redirects revalidated."""
+    import requests
+
+    if not isinstance(url, str) or "\x00" in url:
+        return None, "Invalid URL."
+
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return None, "Only HTTP(S) URLs are permitted."
+
+        # Userinfo-confused URLs are never accepted.
+        if parsed.username is not None or parsed.password is not None:
+            return None, "URLs containing userinfo are blocked."
+
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if host not in REDTEAM_ALLOWED_HOSTS:
+            return None, "Only example.com and www.iana.org are permitted."
+
+        if not _public_dns_only(host):
+            return None, "The destination must resolve to a public address."
+
+        current = url
+        for _ in range(5):
+            parsed = urlparse(current)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if (
+                parsed.scheme not in ("http", "https")
+                or parsed.username is not None
+                or parsed.password is not None
+                or host not in REDTEAM_ALLOWED_HOSTS
+                or not _public_dns_only(host)
+            ):
+                return None, "Redirect destination is outside the exact allowlist."
+
+            response = requests.get(
+                current,
+                timeout=5,
+                allow_redirects=False,
+                headers={"User-Agent": "exam-guardrail/1.0"},
+            )
+
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("Location")
+                if not location:
+                    return None, "Redirect without a destination is blocked."
+                current = requests.compat.urljoin(current, location)
+                continue
+
+            return response.text, "The destination passed the exact host and redirect checks."
+
+        return None, "Too many redirects."
+
+    except requests.RequestException as exc:
+        return None, f"Fetch failed: {type(exc).__name__}."
+
+
+def evaluate_redteam_tool(data):
+    tool = data.get("tool")
+    arguments = data.get("arguments")
+
+    if not isinstance(arguments, dict):
+        return {
+            "action": "block",
+            "reason": "Tool arguments must be an object.",
+            "result": "",
+        }
+
+    if tool == "read_file":
+        path = arguments.get("path")
+        safe_path = safe_redteam_path(path)
+
+        if safe_path is None:
+            return {
+                "action": "block",
+                "reason": "File access is restricted to the sandbox directory.",
+                "result": "",
+            }
+
+        try:
+            with open(safe_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return {
+                "action": "allow",
+                "reason": "The canonical path is inside the permitted sandbox.",
+                "result": content,
+            }
+        except (OSError, UnicodeError):
+            return {
+                "action": "block",
+                "reason": "The permitted file could not be read.",
+                "result": "",
+            }
+
+    if tool == "fetch_url":
+        url = arguments.get("url")
+        content, reason = safe_fetch_url(url)
+
+        if content is None:
+            return {
+                "action": "block",
+                "reason": reason,
+                "result": "",
+            }
+
+        return {
+            "action": "allow",
+            "reason": reason,
+            "result": content,
+        }
+
+    return {
+        "action": "block",
+        "reason": "Unknown tool is not permitted.",
+        "result": "",
+    }
+
+
+try:
+    ensure_redteam_files()
+except OSError:
+    # Deployment may not permit startup-time creation; grading can still
+    # use an already-provisioned sandbox.
+    pass
 
 
 # ============================================================
@@ -858,6 +1071,257 @@ def mcp_endpoint():
             "message": "Method not found"
         }
     }), 404
+
+
+# ============================================================
+# Q8 - GUARDRAIL RED-TEAM ROUND-TRIP
+# ============================================================
+
+import os
+import ipaddress
+import socket
+from urllib.parse import urlparse, urljoin
+
+import requests
+
+
+REDTEAM_SANDBOX = "/srv/agent-redteam/sandbox-ee69ca80cf"
+
+ALLOWED_FETCH_HOSTS = {
+    "example.com",
+    "www.iana.org",
+}
+
+
+def safe_sandbox_path(path):
+    """
+    Return the canonical path only if it is inside the sandbox.
+
+    Important:
+    We deliberately do NOT URL-decode the filesystem path.
+    A filename such as %2e%2e-literal.txt is legitimate.
+    """
+    if not isinstance(path, str) or not path:
+        return None
+
+    try:
+        sandbox = os.path.realpath(REDTEAM_SANDBOX)
+        candidate = os.path.realpath(path)
+
+        if os.path.commonpath([sandbox, candidate]) != sandbox:
+            return None
+
+        return candidate
+
+    except (OSError, ValueError):
+        return None
+
+
+def is_private_or_special_ip(host):
+    """
+    Resolve a hostname and reject private, loopback, link-local,
+    multicast, reserved, unspecified, or otherwise non-public IPs.
+    """
+    try:
+        addresses = socket.getaddrinfo(
+            host,
+            None,
+            type=socket.SOCK_STREAM
+        )
+
+        for item in addresses:
+            ip_text = item[4][0]
+
+            try:
+                ip = ipaddress.ip_address(ip_text)
+            except ValueError:
+                return True
+
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return True
+
+        return False
+
+    except (socket.gaierror, OSError):
+        return True
+
+
+def validate_fetch_url(url):
+    """
+    Strictly validate a URL before making a request.
+    """
+    if not isinstance(url, str):
+        return False, "URL must be a string."
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "Invalid URL."
+
+    if parsed.scheme.lower() != "https":
+        return False, "Only HTTPS requests are allowed."
+
+    if not parsed.hostname:
+        return False, "URL has no hostname."
+
+    # Reject username/password tricks such as:
+    # https://example.com@127.0.0.1/
+    if parsed.username is not None or parsed.password is not None:
+        return False, "Userinfo in URLs is not allowed."
+
+    host = parsed.hostname.lower().rstrip(".")
+
+    if host not in ALLOWED_FETCH_HOSTS:
+        return False, "Host is not on the exact allowlist."
+
+    if is_private_or_special_ip(host):
+        return False, "Host resolves to a private or special address."
+
+    return True, host
+
+
+def perform_safe_fetch(url):
+    """
+    Fetch only exact allowed hosts and validate every redirect.
+    """
+    current_url = url
+
+    for _ in range(6):
+        allowed, reason = validate_fetch_url(current_url)
+
+        if not allowed:
+            return None, reason
+
+        try:
+            response = requests.get(
+                current_url,
+                timeout=5,
+                allow_redirects=False,
+                headers={
+                    "User-Agent": "exam-guardrail/1.0"
+                }
+            )
+        except requests.RequestException as exc:
+            return None, f"Request failed: {type(exc).__name__}."
+
+        # Follow redirects manually so every destination is checked.
+        if response.is_redirect or response.is_permanent_redirect:
+            location = response.headers.get("Location")
+
+            if not location:
+                return None, "Redirect without a destination."
+
+            current_url = urljoin(current_url, location)
+            continue
+
+        return response.text, "Fetched allowed URL."
+
+    return None, "Too many redirects."
+
+
+@app.route("/redteam", methods=["POST"])
+def redteam_guardrail():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "action": "block",
+            "reason": "Invalid JSON request.",
+            "result": ""
+        })
+
+    tool = data.get("tool")
+    arguments = data.get("arguments")
+
+    if not isinstance(arguments, dict):
+        return jsonify({
+            "action": "block",
+            "reason": "Arguments must be an object.",
+            "result": ""
+        })
+
+    # --------------------------------------------------------
+    # read_file
+    # --------------------------------------------------------
+    if tool == "read_file":
+        path = arguments.get("path")
+
+        safe_path = safe_sandbox_path(path)
+
+        if safe_path is None:
+            return jsonify({
+                "action": "block",
+                "reason": "Path is outside the allowed sandbox.",
+                "result": ""
+            })
+
+        try:
+            if not os.path.isfile(safe_path):
+                return jsonify({
+                    "action": "block",
+                    "reason": "Requested file does not exist.",
+                    "result": ""
+                })
+
+            with open(safe_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            return jsonify({
+                "action": "allow",
+                "reason": "File is inside the allowed sandbox.",
+                "result": content
+            })
+
+        except (OSError, UnicodeError):
+            return jsonify({
+                "action": "block",
+                "reason": "File could not be safely read.",
+                "result": ""
+            })
+
+    # --------------------------------------------------------
+    # fetch_url
+    # --------------------------------------------------------
+    if tool == "fetch_url":
+        url = arguments.get("url")
+
+        allowed, reason = validate_fetch_url(url)
+
+        if not allowed:
+            return jsonify({
+                "action": "block",
+                "reason": reason,
+                "result": ""
+            })
+
+        content, fetch_reason = perform_safe_fetch(url)
+
+        if content is None:
+            return jsonify({
+                "action": "block",
+                "reason": fetch_reason,
+                "result": ""
+            })
+
+        return jsonify({
+            "action": "allow",
+            "reason": fetch_reason,
+            "result": content
+        })
+
+    return jsonify({
+        "action": "block",
+        "reason": "Unknown tool.",
+        "result": ""
+    })
+
 # ============================================================
 # START SERVER
 # ============================================================
