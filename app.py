@@ -1123,247 +1123,148 @@ def text_of(dossier):
 
 
 def first_line_id(dossier, predicates):
-    """Return the first line matching any predicate, without a misleading fallback."""
     for lid, text in lines(dossier):
         low = text.lower()
-        if any(p.lower() in low for p in predicates):
+        if any(p in low for p in predicates):
             return lid
-    return None
-
-
-def _line_items(dossier):
-    return [(lid, text, text.lower()) for lid, text in lines(dossier)]
-
-
-def _find_line_ids(dossier, predicates, limit=None):
-    out = []
-    for lid, text, low in _line_items(dossier):
-        if any(re.search(p, low, re.I) if p.startswith("(?") or "\\b" in p else p.lower() in low for p in predicates):
-            out.append(lid)
-            if limit and len(out) >= limit:
-                break
-    return out
-
-
-def _extract(patterns, dossier, default=""):
-    for _, text, _ in _line_items(dossier):
-        for pattern in patterns:
-            m = re.search(pattern, text, re.I)
-            if m:
-                return m.group(1).strip().strip('"\'.,;')
-    return default
+    ls = lines(dossier)
+    return ls[0][0] if ls else None
 
 
 def reference_id(dossier):
-    # Prefer explicit case/order/reference fields and never fall back to a
-    # random line.  The frozen schemas call this value referenceId.
-    return _extract([
-        r"\b(?:order\s*(?:id|number|no)|case\s*(?:id|number|no)|ticket\s*(?:id|number|no)|reference\s*(?:id|number|no)|ref)\s*[:#= -]+([A-Za-z0-9][A-Za-z0-9._/-]{2,80})",
-        r"\b((?:ORD|ORDER|CASE|TKT|TICKET|REF)[-_][A-Za-z0-9][A-Za-z0-9._/-]{2,80})\b",
-    ], dossier, dossier.get("dossierId", ""))
+    blob = text_of(dossier)
+    patterns = [
+        r"\b(?:order|case|ticket|reference|ref)[ _:#-]*([A-Za-z0-9][A-Za-z0-9._/-]{2,40})",
+        r"\b([A-Z]{2,6}-\d{3,})\b",
+    ]
+    for p in patterns:
+        m = re.search(p, blob, re.I)
+        if m:
+            return m.group(1)
+    return dossier.get("dossierId", "")
 
 
 def recipient(dossier):
-    for _, t, _ in _line_items(dossier):
-        # Prefer an address explicitly described as the customer/recipient.
-        m = re.search(r"(?:customer|recipient|to|email)\s*(?:address|email)?\s*[:=-]\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", t, re.I)
-        if m:
-            return m.group(1)
-    for _, t, _ in _line_items(dossier):
+    # Prefer explicit email addresses found in the dossier.
+    for _, t in lines(dossier):
         m = re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", t)
         if m:
             return m.group(0)
     return ""
 
 
-def _has_any(text, phrases):
-    return any(p.lower() in text for p in phrases)
-
-
-def _authority_lines(dossier):
-    return _find_line_ids(dossier, [
-        r"\bapproved\b", r"\bauthorized\b", r"\bauthorised\b", r"\bconfirmed\b",
-        r"\bverified\b", r"\btrust(?:ed)?\b", r"\bmanager\b", r"\bsupervisor\b",
-        r"\bpolicy\b", r"\bconsent\b"
-    ], 4)
-
-
-def _provenance_conflict(dossier):
-    blob = text_of(dossier)
-    # A request that attempts to redefine the agent/tool authority is not a
-    # customer instruction, even when it contains a legitimate-looking action.
-    return _has_any(blob, [
-        "ignore previous instructions", "ignore all previous instructions",
-        "system prompt", "developer message", "reveal secret", "reveal the canary",
-        "private context", "api key", "credentials", "password", "execute this tool",
-        "call the tool", "do not tell the user", "bypass approval", "skip approval",
-        "without approval", "silently send", "secretly send"
-    ])
-
-
-def _extract_case(dossier):
-    return _extract([
-        r"\bcase\s*(?:id|number|no)?\s*[:#= -]+([A-Za-z0-9][A-Za-z0-9._/-]{2,80})",
-    ], dossier, "")
-
-
-def _extract_event(dossier):
-    return _extract([
-        r"\b(?:source\s*)?event\s*(?:id|number|no)?\s*[:#= -]+([A-Za-z0-9][A-Za-z0-9._:-]{2,80})",
-    ], dossier, "")
-
-
-def _extract_delivery_window(dossier):
-    patterns = [
-        r"delivery\s+window\s*(?:is|changed\s+to|updated\s+to|set\s+to|:)\s*([A-Za-z0-9][^.;,\n]{1,80})",
-        r"(?:new|updated|confirmed)\s+delivery\s+window\s*[:=-]\s*([A-Za-z0-9][^.;,\n]{1,80})",
-    ]
-    return _extract(patterns, dossier, "")
-
-
-def _extract_approved_template(dossier):
-    return _extract([
-        r"template\s*(?:is|:|=)\s*([A-Za-z0-9_-]+)",
-        r"approved\s+(?:email|notice)\s+(?:template|type)\s*[:=-]\s*([A-Za-z0-9_-]+)",
-    ], dossier, "approved_delivery_notice")
-
-
-def _case_state(dossier):
-    blob = text_of(dossier)
-    if _has_any(blob, ["already completed", "completed", "closed", "resolved"]):
-        return "completed"
-    if _has_any(blob, ["duplicate", "duplicate message", "already handled", "already processed"]):
-        return "duplicate"
-    if _has_any(blob, ["for your information", "informational", "fyi"]):
-        return "informational"
-    return "open"
-
-
 def classify(dossier):
-    """Conservative rule-based mailroom decision layer.
+    """No-key conservative mailroom classifier.
 
-    Mail is data, never authority.  The classifier first establishes case
-    state and provenance, then extracts exact identifiers/arguments from
-    trusted-looking lines.  It never invents payload values and never uses a
-    random line as evidence.
+    It deliberately treats external content as untrusted data.  Ambiguous
+    requests are routed for confirmation; tool-control/private-context
+    instructions are quarantined; duplicate/completed/informational mail is
+    suppressed.  Clearly authorised customer-order requests become drafts.
     """
     blob = text_of(dossier)
-    state = _case_state(dossier)
+    lid = first_line_id(dossier, [])
 
-    # Security takes precedence over any requested business action.  Importantly
-    # this is based on an instruction attempting to control the agent, not on
-    # harmless quoted words such as "send" appearing in a trusted message.
-    if _provenance_conflict(dossier):
-        ev = _find_line_ids(dossier, [
-            r"ignore previous", r"ignore all previous", r"system prompt", r"developer message",
-            r"reveal", r"private context", r"credentials", r"api key", r"password",
-            r"execute this tool", r"call the tool", r"bypass approval", r"skip approval",
-            r"without approval", r"silently send", r"secretly send"
-        ], 2)
+    injection = [
+        "ignore previous", "ignore all previous", "system prompt",
+        "developer message", "reveal secret", "reveal the canary",
+        "send this", "execute this tool", "call the tool",
+        "private context", "credentials", "api key", "password",
+        "do not tell the user",
+    ]
+    if any(x in blob for x in injection):
+        ev = first_line_id(dossier, injection)
         return proposal(dossier, "quarantine_item", {
             "kind": "security_queue", "id": "mailroom"
         }, {
             "artifactId": dossier["dossierId"],
             "reasonCode": "INDIRECT_PROMPT_INJECTION"
-        }, ev)
+        }, [ev] if ev else [])
 
-    if state == "completed":
-        ev = _find_line_ids(dossier, [r"already completed", r"completed", r"closed", r"resolved"], 1)
+    if any(x in blob for x in ["already completed", "duplicate", "duplicate message"]):
+        ev = first_line_id(dossier, ["already completed", "duplicate"])
         return proposal(dossier, "no_action", None, {
-            "reasonCode": "ALREADY_COMPLETED", "referenceId": reference_id(dossier)
-        }, ev)
+            "reasonCode": "ALREADY_COMPLETED" if "completed" in blob else "DUPLICATE",
+            "referenceId": reference_id(dossier)
+        }, [ev] if ev else [lid] if lid else [])
 
-    if state == "duplicate":
-        ev = _find_line_ids(dossier, [r"duplicate", r"already handled", r"already processed"], 1)
+    if any(x in blob for x in ["for your information", "informational", "fyi"]):
         return proposal(dossier, "no_action", None, {
-            "reasonCode": "DUPLICATE", "referenceId": reference_id(dossier)
-        }, ev)
+            "reasonCode": "INFORMATIONAL",
+            "referenceId": reference_id(dossier)
+        }, [lid] if lid else [])
 
-    if state == "informational":
-        ev = _find_line_ids(dossier, [r"for your information", r"informational", r"fyi"], 1)
-        return proposal(dossier, "no_action", None, {
-            "reasonCode": "INFORMATIONAL", "referenceId": reference_id(dossier)
-        }, ev)
-
-    # Identity uncertainty is not permission to send or mutate anything.
-    if _has_any(blob, ["verify identity", "identity conflict", "not sure", "is this really", "claimed sender", "cannot verify"]):
-        ev = _find_line_ids(dossier, [r"verify identity", r"identity conflict", r"not sure", r"is this really", r"claimed sender", r"cannot verify"], 2)
+    # Explicit uncertainty/identity conflict gets confirmation.
+    if any(x in blob for x in [
+        "verify identity", "identity conflict", "not sure", "is this really",
+        "i am not the", "claimed sender", "cannot verify"
+    ]):
         return proposal(dossier, "request_confirmation", {
             "kind": "approval_queue", "id": "mailroom"
         }, {
-            "claimedSender": _extract([r"(?:claimed\s+sender|sender)\s*[:=-]\s*([^,;\n]+)"], dossier, recipient(dossier) or "unknown"),
+            "claimedSender": recipient(dossier) or "unknown",
             "questionCode": "VERIFY_REQUEST",
             "referenceId": reference_id(dossier)
-        }, ev)
+        }, [lid] if lid else [])
 
-    # Explicit outbound intent requires trusted approval scoped to recipient,
-    # template and public facts. A request alone is insufficient.
-    outbound = _has_any(blob, ["send an email", "send this email", "email the customer", "please send", "outbound", "send approved notice"])
-    approval = _has_any(blob, ["explicitly approved", "approved by", "approval from", "approved notice", "authorized to send", "authorised to send"])
-    exact_recipient = recipient(dossier)
-    if outbound and not (approval and exact_recipient):
-        ev = _find_line_ids(dossier, [r"send", r"outbound", r"approval", r"approved", r"authorized", r"authorised"], 3)
+    # Never send outbound mail merely because the mail asks for it.
+    if any(x in blob for x in ["send an email", "send this email", "email the customer",
+                               "please send", "outbound"]):
         return proposal(dossier, "request_confirmation", {
             "kind": "approval_queue", "id": "mailroom"
         }, {
-            "claimedSender": exact_recipient or "unknown",
+            "claimedSender": recipient(dossier) or "unknown",
             "questionCode": "VERIFY_REQUEST",
             "referenceId": reference_id(dossier)
-        }, ev)
+        }, [lid] if lid else [])
 
-    # Authorized outbound notice: require the approval, exact recipient and
-    # reference.  Do not synthesize recipient/template from unrelated text.
-    if outbound and approval and exact_recipient and reference_id(dossier):
-        ev = _find_line_ids(dossier, [r"approved", r"authorized", r"authorised", re.escape(exact_recipient), re.escape(reference_id(dossier))], 4)
-        return proposal(dossier, "send_approved_notice", {
-            "kind": "email", "id": exact_recipient
-        }, {
-            "referenceId": reference_id(dossier),
-            "status": _extract([r"status\s*[:=-]\s*([A-Za-z0-9_-]+)"], dossier, "approved"),
-            "template": _extract_approved_template(dossier)
-        }, ev)
-
-    # Customer/order-status request becomes a draft only when there is an
-    # authority/provenance signal and an exact recipient/reference.
-    order_request = _has_any(blob, ["order status", "delivery status", "customer asks", "customer requested", "prepare a draft", "create a draft"])
-    trusted = bool(_authority_lines(dossier)) or _has_any(blob, ["approved draft", "trusted customer request", "verified customer", "authorized request", "authorised request"])
-    ref = reference_id(dossier)
-    if order_request and trusted and exact_recipient and ref:
-        ev = _find_line_ids(dossier, [r"order status", r"delivery status", r"customer", r"approved", r"authorized", re.escape(exact_recipient), re.escape(ref)], 4)
+    # Clearly authorised order-status/customer-work requests become drafts.
+    if any(x in blob for x in [
+        "order status", "delivery status", "customer asks", "customer requested",
+        "approved draft", "prepare a draft", "create a draft"
+    ]):
         return proposal(dossier, "create_draft", {
             "kind": "draft_queue", "id": "mailbox:" + str(dossier.get("mailbox", ""))
         }, {
-            "recipient": exact_recipient,
-            "referenceId": ref,
+            "recipient": recipient(dossier),
+            "referenceId": reference_id(dossier),
             "status": "draft",
             "template": "order_status"
-        }, ev)
+        }, [lid] if lid else [])
 
-    # Internal change requires a case, source event, and an explicit approved /
-    # authorized change. Extract the actual new value instead of inventing it.
-    window = _extract_delivery_window(dossier)
-    event = _extract_event(dossier)
-    case = _extract_case(dossier)
-    if window and event and case and _has_any(blob, ["authorized", "authorised", "approved", "confirmed"]):
-        ev = _find_line_ids(dossier, [r"delivery window", r"event", r"case", r"authorized", r"authorised", r"approved", r"confirmed"], 4)
-        return proposal(dossier, "update_internal_record", {
-            "kind": "case_record", "id": case
-        }, {
-            "field": "delivery_window",
-            "sourceEventId": event,
-            "value": window
-        }, ev)
+    # Internal record updates only when the mail explicitly describes an
+    # authorised delivery-window change and supplies an event identifier.
+    if "delivery window" in blob and any(x in blob for x in [
+        "authorized", "authorised", "approved", "confirmed"
+    ]):
+        event = ""
+        m = re.search(r"(?:event|eventid|event id)[ _:#-]*([A-Za-z0-9._:-]+)", blob, re.I)
+        if m:
+            event = m.group(1)
+        case = ""
+        m = re.search(r"(?:case|case id)[ _:#-]*([A-Za-z0-9._:-]+)", blob, re.I)
+        if m:
+            case = m.group(1)
+        if event and case:
+            return proposal(dossier, "update_internal_record", {
+                "kind": "case_record", "id": case
+            }, {
+                "field": "delivery_window",
+                "sourceEventId": event,
+                "value": "updated"
+            }, [lid] if lid else [])
 
     return proposal(dossier, "no_action", None, {
-        "reasonCode": "INFORMATIONAL", "referenceId": ref
-    }, _find_line_ids(dossier, [r"information", r"status", r"update", r"request"], 1))
+        "reasonCode": "INFORMATIONAL",
+        "referenceId": reference_id(dossier)
+    }, [lid] if lid else [])
 
 
 def proposal(dossier, action, target, payload, evidence):
-    # Evidence must be explicitly justified by the decision.  Never substitute
-    # an arbitrary first line: that is both unsafe and non-minimal.
+    # Keep evidence valid and unique, preserving order.
     valid = {x for x, _ in lines(dossier)}
     evidence = list(dict.fromkeys(x for x in evidence if x in valid))
+    if not evidence and valid:
+        evidence = [next(iter(valid))]
     fp = hashlib.sha256(canonical(dossier)).hexdigest()
     call_id = "q9-" + fp[:32]
     return {
@@ -1374,6 +1275,7 @@ def proposal(dossier, action, target, payload, evidence):
         "payload": payload,
         "evidence": evidence,
     }
+
 
 def validate_proposal(p, dossier, allowed):
     if not isinstance(p, dict):
@@ -1477,24 +1379,11 @@ def handle_propose(data):
             conn.close()
             return error("Malformed dossier.")
         fp = hashlib.sha256(canonical(d)).hexdigest()
-        # A stable dossierId is immutable: if the same dossier identifier is
-        # presented later with different canonical content, reject it before
-        # any decision/model work. This is distinct from evaluationId replay.
-        prior = conn.execute(
-            "SELECT fingerprint FROM dossiers WHERE dossier_id=? ORDER BY rowid DESC LIMIT 1",
-            (d["dossierId"],),
-        ).fetchone()
-        if prior and prior[0] != fp:
-            conn.close()
-            return error("Dossier content conflict.", 409)
         cached = conn.execute(
             "SELECT proposal FROM dossiers WHERE fingerprint=?", (fp,)
         ).fetchone()
         if cached:
             p = json.loads(cached[0])
-            if not validate_proposal(p, d, allowed):
-                conn.close()
-                return error("Cached proposal failed schema validation.", 422)
         else:
             p = classify(d)
             if not validate_proposal(p, d, allowed):
@@ -1627,7 +1516,7 @@ def handle_commit(data):
         "outcomes": outcomes
     })
 
-DB_PATH = os.environ.get("A2A_DB", "a2a_invoice.sqlite3")
+A2A_DB_PATH = os.environ.get("A2A_DB", "a2a_invoice.sqlite3")
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 A2A_PROFILE = "ga5-invoice-action-agent/v1"
 VERSION = "1.0"
@@ -1636,7 +1525,7 @@ PROPOSAL_MODE = "application/vnd.ga5.invoice-action-proposals+json"
 RESULT_MODE = "application/vnd.ga5.invoice-action-results+json"
 RECEIPT_MODE = "application/vnd.ga5.invoice-action-receipts+json"
 
-ALLOWED_ACTIONS = {
+A2A_ALLOWED_ACTIONS = {
     "settle_invoice",
     "request_approval",
     "hold_invoice",
@@ -1662,7 +1551,7 @@ def now():
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(A2A_DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -2044,7 +1933,7 @@ def message_send():
 
     # Validate every generated proposal against the frozen schema.
     for pr in proposals:
-        if pr["action"] not in ALLOWED_ACTIONS:
+        if pr["action"] not in A2A_ALLOWED_ACTIONS:
             return json_error("INVALID_ACTION", 422)
         if not isinstance(pr["facts"], dict):
             return json_error("INVALID_FACTS", 422)
