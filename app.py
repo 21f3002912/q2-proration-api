@@ -772,6 +772,92 @@ def run_guard():
         )
     })
 
+
+import hashlib
+
+EXAM_EMAIL = "21f3002912@ds.study.iitm.ac.in"
+
+
+@app.route("/mcp", methods=["POST"])
+def mcp_endpoint():
+    data = request.get_json(silent=True) or {}
+
+    method = data.get("method")
+
+    # MCP initialize
+    if method == "initialize":
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": data.get("id"),
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "exam-mcp-server",
+                    "version": "1.0.0"
+                }
+            }
+        })
+
+    # MCP notification
+    if method == "notifications/initialized":
+        return ("", 202)
+
+    # List exactly one tool
+    if method == "tools/list":
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": data.get("id"),
+            "result": {
+                "tools": [
+                    {
+                        "name": "solve_challenge",
+                        "description": "Solve the exam challenge.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
+                ]
+            }
+        })
+
+    # Tool call
+    if method == "tools/call":
+        challenge = request.headers.get("X-Exam-Challenge", "")
+
+        normalized_email = EXAM_EMAIL.strip().lower()
+
+        value = f"{challenge}:{normalized_email}"
+
+        answer = hashlib.sha256(
+            value.encode("utf-8")
+        ).hexdigest()[:16]
+
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": data.get("id"),
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": answer
+                    }
+                ]
+            }
+        })
+
+    return jsonify({
+        "jsonrpc": "2.0",
+        "id": data.get("id"),
+        "error": {
+            "code": -32601,
+            "message": "Method not found"
+        }
+    }), 404
 # ============================================================
 # START SERVER
 # ============================================================
