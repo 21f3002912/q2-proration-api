@@ -2231,6 +2231,19 @@ app.view_functions["message_send"] = _message_send_dispatch
 def too_large(_):
     return json_error("REQUEST_TOO_LARGE", 413)
 
+@app.after_request
+def set_a2a_content_type(response):
+    if (
+        request.path == "/message:send"
+        or request.path == "/tasks"
+        or request.path.startswith("/tasks/")
+        or request.path == "/a2a/message:send"
+        or request.path == "/a2a/tasks"
+        or request.path.startswith("/a2a/tasks/")
+    ):
+        response.content_type = "application/a2a+json"
+    return response
+
 # ============================================================
 # START SERVER
 # ============================================================
